@@ -192,6 +192,8 @@
   let opponentRace = null;
   let enemyScope = "arrival";
   const economyAssumptions = { points: 4, listeningPosts: 2, generators: 2 };
+  const SQUAD_SPACING = { initial: 3, step: 0.5, min: 1, max: 8 };
+  let squadSpacing = SQUAD_SPACING.initial;
 
   const formatSpellCost = (cost) => Object.entries(cost)
     .map(([resource, amount]) => `${formatNumber(amount)} ${resource}`).join(" · ") || "Free";
@@ -477,15 +479,16 @@
 
   const damageRangeOf = (weapon) => String(weapon.damage).replaceAll(",", "").split("–").map(Number);
 
+  const accuracyOf = (weapon, modifiersOf) => Math.min(1, modifiedValue(weapon.accuracy, [
+    ...modifiersOf(weapon.id, "accuracy_weapon_modifier"), ...modifiersOf(weapon.id, "accuracy_ranged_weapon_modifier")]));
+
   function weaponScaleOf(weapon, modifiersOf) {
     const [minimum, maximum = minimum] = damageRangeOf(weapon);
     const damageScale = minimum + maximum
       ? (modifiedValue(minimum, modifiersOf(weapon.id, "min_damage_weapon_modifier"))
         + modifiedValue(maximum, modifiersOf(weapon.id, "max_damage_weapon_modifier"))) / (minimum + maximum)
       : 1;
-    const accuracyModifiers = [...modifiersOf(weapon.id, "accuracy_weapon_modifier"),
-      ...modifiersOf(weapon.id, "accuracy_ranged_weapon_modifier")];
-    const accuracyScale = weapon.accuracy ? Math.min(1, modifiedValue(weapon.accuracy, accuracyModifiers)) / weapon.accuracy : 1;
+    const accuracyScale = weapon.accuracy ? accuracyOf(weapon, modifiersOf) / weapon.accuracy : 1;
     return damageScale * accuracyScale;
   }
 
@@ -520,11 +523,14 @@
     }
     const dps = { ranged: data.armour.map(() => 0), melee: data.armour.map(() => 0) };
     const rangedWeapons = [];
+    const firingWeapons = [];
     copiesByWeapon.forEach((copies, weapon) => {
       if (!copies || weapon.effectOnly) return;
       const mode = weapon.melee ? "melee" : "ranged";
       if (mode === "ranged") rangedWeapons.push(weapon);
       const scale = weaponScaleOf(weapon, modifiersOf);
+      const landedShotsPerSecond = weapon.reload ? (copies * accuracyOf(weapon, modifiersOf)) / weapon.reload : 0;
+      firingWeapons.push({ weapon, mode, copies, scale, landedShotsPerSecond });
       weapon.dps.forEach((value, armourIndex) => { dps[mode][armourIndex] += (value || 0) * copies * scale; });
     });
     const largestRangedValue = (key) => Math.max(0, ...rangedWeapons.map((weapon) => weapon[key] || 0));
@@ -532,6 +538,7 @@
     return {
       buys,
       dps,
+      firingWeapons,
       models: unit.models.map((model) => ({ model, count: modelCounts.get(model.name),
         hp: modifiedValue(model.hp, modifiersOf(model.id, "health_maximum_modifier")) })),
       reach: largestRangedValue("range"),
@@ -761,14 +768,65 @@
       + leaders.reduce((total, leader) => total + maxModelCount(leader) * resourcesOf(leader.cost), 0);
   }
 
+  const squadSizeOf = (profile) => sumOf(profile.models.map(({ count }) => count));
+
+  function splashAreaOf(weapon) {
+    const circleArea = Math.PI * weapon.aoe ** 2;
+    if (weapon.splashShape === "circle") return circleArea;
+    if (weapon.splashShape === "pie") return (weapon.splashAngle / 360) * circleArea;
+    return 0;
+  }
+
+  function averageModelsHit(weapon, squadSize) {
+    const modelsUnderSplash = Math.max(1, splashAreaOf(weapon) / squadSpacing ** 2);
+    const hitsWhileAlive = Array.from({ length: squadSize }, (_, index) => Math.min(index + 1, modelsUnderSplash));
+    return sumOf(hitsWhileAlive) / squadSize;
+  }
+
   function timeToKill(attacker, defender) {
-    const secondsUsing = (mode) => defender.models.reduce((total, { model, count, hp }) => {
-      const dps = attacker.dps[mode][armourIndexByName.get(model.armour)] || 0;
-      return total + (dps ? (hp * count) / dps : Infinity);
-    }, 0);
+    const squadSize = squadSizeOf(defender);
+    const squadDpsUsing = (mode) => {
+      const squadDps = data.armour.map(() => 0);
+      for (const { weapon, copies, scale } of attacker.firingWeapons.filter((entry) => entry.mode === mode)) {
+        const modelsHit = averageModelsHit(weapon, squadSize);
+        weapon.dps.forEach((value, armourIndex) => { squadDps[armourIndex] += (value || 0) * copies * scale * modelsHit; });
+      }
+      return squadDps;
+    };
+    const secondsUsing = (mode) => {
+      const squadDps = squadDpsUsing(mode);
+      return defender.models.reduce((total, { model, count, hp }) => {
+        const dps = squadDps[armourIndexByName.get(model.armour)] || 0;
+        return total + (dps ? (hp * count) / dps : Infinity);
+      }, 0);
+    };
     const ranged = secondsUsing("ranged");
     const melee = secondsUsing("melee");
     return ranged <= melee ? { seconds: ranged, mode: "ranged" } : { seconds: melee, mode: "melee" };
+  }
+
+  function shareKnockedDown(thrower, throwerMode, target) {
+    const squadSize = squadSizeOf(target);
+    const vulnerable = target.models.filter(({ model }) => !model.knockdownImmune);
+    const vulnerableCount = sumOf(vulnerable.map(({ count }) => count));
+    if (!vulnerableCount) return 0;
+    const vulnerableShare = vulnerableCount / squadSize;
+    const averageGetUpTime = sumOf(vulnerable.map(({ model, count }) => model.getUpTime * count)) / vulnerableCount;
+    const modelSecondsDownPerSecond = sumOf(thrower.firingWeapons
+      .filter(({ weapon, mode }) => weapon.throws && mode === throwerMode)
+      .map(({ weapon, landedShotsPerSecond }) => landedShotsPerSecond * averageModelsHit(weapon, squadSize)
+        * vulnerableShare * averageGetUpTime));
+    return Math.min(vulnerableShare, modelSecondsDownPerSecond / squadSize);
+  }
+
+  function killTimesOf(ours, theirs) {
+    const ourPlan = timeToKill(ours, theirs);
+    const theirPlan = timeToKill(theirs, ours);
+    const slowedBy = (share) => (share >= 1 ? Infinity : 1 / (1 - share));
+    return {
+      ours: { ...ourPlan, seconds: ourPlan.seconds * slowedBy(shareKnockedDown(theirs, theirPlan.mode, ours)) },
+      theirs: { ...theirPlan, seconds: theirPlan.seconds * slowedBy(shareKnockedDown(ours, ourPlan.mode, theirs)) },
+    };
   }
 
   function exchangeRatio(ourSeconds, theirSeconds) {
@@ -869,8 +927,7 @@
   }
 
   function duelOf(ours, theirs) {
-    const ourKill = timeToKill(ours, theirs);
-    const theirKill = timeToKill(theirs, ours);
+    const { ours: ourKill, theirs: theirKill } = killTimesOf(ours, theirs);
     return { ours: ourKill, theirs: theirKill, exchange: exchangeRatio(ourKill.seconds, theirKill.seconds),
       engagement: engagementOf(ours, theirs, ourKill, theirKill) };
   }
@@ -902,16 +959,22 @@
     return { offers, squadLimit, isLeaderWeapon, squadBuysIn, canBuy, keepAllowed };
   }
 
+  function standingAgainst(profile, defender) {
+    const { ours, theirs } = killTimesOf(profile, defender);
+    return { profile, exchange: exchangeRatio(ours.seconds, theirs.seconds) ?? 0, seconds: ours.seconds };
+  }
+
+  const isBetterStanding = (candidate, current) => (candidate.exchange === current.exchange
+    ? candidate.seconds < current.seconds : candidate.exchange > current.exchange);
+
   function bestBuysAgainst(unit, defender, withResearch) {
     const rules = buyingRulesOf(unit, withResearch);
-    const unbuilt = unbuiltProfileOf(unit, withResearch);
-    let best = { profile: unbuilt, seconds: timeToKill(unbuilt, defender).seconds };
+    let best = standingAgainst(unbuiltProfileOf(unit, withResearch), defender);
     for (;;) {
       let improvement = null;
       for (const offer of rules.offers.filter((candidate) => rules.canBuy(best.profile.buys, candidate))) {
-        const profile = combatProfileOf(unit, withResearch, [...best.profile.buys, offer]);
-        const seconds = timeToKill(profile, defender).seconds;
-        if (seconds < (improvement || best).seconds) improvement = { profile, seconds };
+        const candidate = standingAgainst(combatProfileOf(unit, withResearch, [...best.profile.buys, offer]), defender);
+        if (isBetterStanding(candidate, improvement || best)) improvement = candidate;
       }
       if (!improvement) return best.profile;
       best = improvement;
@@ -919,7 +982,7 @@
   }
 
   const upgradedProfileByPair = new Map();
-  const upgradedProfileOf = (unit, enemy) => remembered(upgradedProfileByPair, `${unit.id}>${enemy.id}`,
+  const upgradedProfileOf = (unit, enemy) => remembered(upgradedProfileByPair, `${unit.id}>${enemy.id}@${squadSpacing}`,
     () => bestBuysAgainst(unit, researchedProfileOf(enemy), true));
 
   function armsRaceOf(unit, enemy) {
@@ -988,6 +1051,12 @@
       <div class="picker-row"><span class="chip-row-label">Enemies</span><div class="picker">${
         scopeButton("arrival", "When you arrive")}${scopeButton("tier", `Up to Tier ${ROMAN_NUMERALS[unit.tier]}`)}${
         scopeButton("all", "All tiers")}</div></div>
+      <div class="picker-row"><span class="chip-row-label">Squad spacing</span><div class="stepper">
+        <button type="button" id="spacing-fewer" data-spacing-step="-1" aria-label="Tighter squads"${
+          squadSpacing <= SQUAD_SPACING.min ? " disabled" : ""}>−</button>
+        <output>${formatNumber(squadSpacing)}</output>
+        <button type="button" id="spacing-more" data-spacing-step="1" aria-label="Looser squads"${
+          squadSpacing >= SQUAD_SPACING.max ? " disabled" : ""}>+</button></div></div>
     </header>`;
   }
 
@@ -1173,8 +1242,13 @@
   function renderMatchupGuide() {
     return `<details><summary>How the matchup numbers work</summary><ul>
       <li>Time to kill is how long a full squad takes to destroy the full enemy squad with whichever of its ranged or melee
-        weapons is faster. Default weapons, before research. Movement, cover, morale and splash are not included. Enemy
+        weapons is faster. Default weapons, before research. Movement, cover and morale are not included. Enemy
         builders are left out.</li>
+      <li>Splash weapons hit every model inside their blast: a circle for grenades and shells, a narrow cone for flamers.
+        Models stand Squad spacing apart, so a blast covering the space of two models hits two, and fewer as the squad
+        dies. A shot that misses hits nothing. A model hit by a weapon that throws is knocked down unless its unit is
+        immune, and deals no damage until it gets up. The share of a squad lying down at any moment slows the damage it
+        deals by the same share. Weapon buys are picked for the best exchange, so knockdown counts toward them.</li>
       <li>Exchange is their time to kill you divided by your time to kill them. ${formatRatio(FAVOURED_EXCHANGE)} or more is
         Favoured; ${formatRatio(1 / FAVOURED_EXCHANGE)} or less is Countered.</li>
       <li>Value trade is the exchange adjusted for what each full squad costs, counting requisition and power equally.</li>
@@ -1252,8 +1326,13 @@
     const economyButton = event.target.closest("[data-economy]");
     const fightButton = event.target.closest("[data-fight-action]");
     const fightRow = event.target.closest("[data-fight]");
+    const spacingButton = event.target.closest("[data-spacing-step]");
     if (opponentButton) opponentRace = data.races.find((race) => race.id === opponentButton.dataset.opponent);
     else if (scopeButton) enemyScope = scopeButton.dataset.enemyScope;
+    else if (spacingButton) {
+      const stepped = squadSpacing + Number(spacingButton.dataset.spacingStep) * SQUAD_SPACING.step;
+      squadSpacing = Math.min(SQUAD_SPACING.max, Math.max(SQUAD_SPACING.min, stepped));
+    }
     else if (economyButton) {
       const { economy: key, step } = economyButton.dataset;
       const current = Math.min(economyAssumptions[key], economyLimitFor(currentRace, key));
