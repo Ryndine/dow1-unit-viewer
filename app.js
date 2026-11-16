@@ -466,11 +466,13 @@
   const modifiedValue = (base, modifiers) =>
     (base + sumOf(modifiers.filter((entry) => entry.usage === "addition").map((entry) => entry.value)))
     * modifiers.filter((entry) => entry.usage === "multiplication").reduce((product, entry) => product * entry.value, 1);
-  const noResearch = () => [];
+  const NO_RESEARCH = new Set();
+  const researchKeyOf = (researchDone) => [...researchDone].sort().join("|");
 
-  function researchModifiersOf(unit) {
+  function researchModifiersOf(unit, researchDone) {
     const entriesByKey = new Map();
-    for (const entry of unit.upgrades.flatMap((upgrade) => upgrade.modifiers)) {
+    const doneUpgrades = unit.upgrades.filter((upgrade) => researchDone.has(upgrade.name));
+    for (const entry of doneUpgrades.flatMap((upgrade) => upgrade.modifiers)) {
       const key = `${entry.target}|${entry.modifier}`;
       entriesByKey.set(key, [...(entriesByKey.get(key) || []), entry]);
     }
@@ -498,19 +500,20 @@
     return new Map(unit.models.map((model) => [model.name, maxModelCount(model) + (model === firstLeader ? extraLeaders : 0)]));
   }
 
-  function equippedSlotsOf(unit, withResearch) {
+  function equippedSlotsOf(unit, researchDone) {
     const slotsByModel = new Map(unit.models.map((model) => [model.name, new Map()]));
+    const researchNameById = new Map(unit.upgrades.map((upgrade) => [upgrade.id, upgrade.name]));
     for (const weapon of unit.weapons) {
-      const isEquipped = weapon.source === "Default" || (withResearch && weapon.unlockedBy);
+      const isEquipped = weapon.source === "Default" || researchDone.has(researchNameById.get(weapon.unlockedBy));
       if (isEquipped) weapon.hardpoints.forEach((hardpoint) => slotsByModel.get(weapon.model).set(hardpoint, weapon));
     }
     return slotsByModel;
   }
 
-  function combatProfileOf(unit, withResearch, buys) {
-    const modifiersOf = withResearch ? researchModifiersOf(unit) : noResearch;
+  function combatProfileOf(unit, researchDone, buys) {
+    const modifiersOf = researchModifiersOf(unit, researchDone);
     const modelCounts = modelCountsOf(unit, modifiersOf);
-    const slotsByModel = equippedSlotsOf(unit, withResearch);
+    const slotsByModel = equippedSlotsOf(unit, researchDone);
     const copiesByWeapon = new Map();
     const addCopies = (weapon, copies) => copiesByWeapon.set(weapon, (copiesByWeapon.get(weapon) || 0) + copies);
     slotsByModel.forEach((slots, modelName) => slots.forEach((weapon) => addCopies(weapon, modelCounts.get(modelName))));
@@ -549,14 +552,14 @@
     };
   }
 
-  const baseProfileByUnit = new Map();
-  const researchedProfileByUnit = new Map();
+  const unbuiltProfileByKey = new Map();
   const remembered = (cache, key, compute) => {
     if (!cache.has(key)) cache.set(key, compute());
     return cache.get(key);
   };
-  const baseProfileOf = (unit) => remembered(baseProfileByUnit, unit, () => combatProfileOf(unit, false, []));
-  const researchedProfileOf = (unit) => remembered(researchedProfileByUnit, unit, () => combatProfileOf(unit, true, []));
+  const unbuiltProfileOf = (unit, researchDone) => remembered(unbuiltProfileByKey,
+    `${unit.id}[${researchKeyOf(researchDone)}]`, () => combatProfileOf(unit, researchDone, []));
+  const baseProfileOf = (unit) => unbuiltProfileOf(unit, NO_RESEARCH);
 
   const averageAt = (values, indexes) => indexes.reduce((sum, index) => sum + values[index], 0) / indexes.length;
   function squadDamageProfile(unit) {
@@ -932,20 +935,21 @@
       engagement: engagementOf(ours, theirs, ourKill, theirKill) };
   }
 
-  const unbuiltProfileOf = (unit, withResearch) => (withResearch ? researchedProfileOf(unit) : baseProfileOf(unit));
+  const researchNamesIn = (requirement) => requirement.text.split(" or ");
 
-  function buyingRulesOf(unit, withResearch) {
-    const countByModel = new Map(unbuiltProfileOf(unit, withResearch).models.map(({ model, count }) => [model.name, count]));
+  function buyingRulesOf(unit, researchDone) {
+    const countByModel = new Map(unbuiltProfileOf(unit, researchDone).models.map(({ model, count }) => [model.name, count]));
     const leaderNames = new Set(unit.models.filter((model) => model.role === "Leader").map((model) => model.name));
     const isLeaderWeapon = (weapon) => leaderNames.has(weapon.model);
-    const squadLimit = unit.capabilities.weaponUpgradeLimit + (withResearch
-      ? sumOf(researchModifiersOf(unit)(unit.id, "max_upgrades_squad_modifier").map((entry) => entry.value)) : 0);
-    const needsResearch = (weapon) => weapon.requires.some((requirement) => requirement.kind === "Research");
-    const slotsByModel = equippedSlotsOf(unit, withResearch);
+    const squadLimit = unit.capabilities.weaponUpgradeLimit
+      + sumOf(researchModifiersOf(unit, researchDone)(unit.id, "max_upgrades_squad_modifier").map((entry) => entry.value));
+    const isResearchMet = (requirement) => requirement.kind !== "Research"
+      || researchNamesIn(requirement).some((name) => researchDone.has(name));
+    const slotsByModel = equippedSlotsOf(unit, researchDone);
     const isAlreadyEquipped = (weapon) => weapon.hardpoints.every((hardpoint) =>
       slotsByModel.get(weapon.model).get(hardpoint) === weapon);
     const offers = unit.weapons.filter((weapon) => weapon.source === "Upgrade" && countByModel.has(weapon.model)
-      && (withResearch || !needsResearch(weapon)) && !isAlreadyEquipped(weapon));
+      && weapon.requires.every(isResearchMet) && !isAlreadyEquipped(weapon));
     const squadBuysIn = (buys) => buys.filter((bought) => !isLeaderWeapon(bought)).length;
     const canBuy = (buys, offer) => {
       const boughtOnSameHardpoint = (hardpoint) => buys.filter((bought) => bought.model === offer.model
@@ -967,13 +971,13 @@
   const isBetterStanding = (candidate, current) => (candidate.exchange === current.exchange
     ? candidate.seconds < current.seconds : candidate.exchange > current.exchange);
 
-  function bestBuysAgainst(unit, defender, withResearch) {
-    const rules = buyingRulesOf(unit, withResearch);
-    let best = standingAgainst(unbuiltProfileOf(unit, withResearch), defender);
+  function bestBuysAgainst(unit, defender, researchDone) {
+    const rules = buyingRulesOf(unit, researchDone);
+    let best = standingAgainst(unbuiltProfileOf(unit, researchDone), defender);
     for (;;) {
       let improvement = null;
       for (const offer of rules.offers.filter((candidate) => rules.canBuy(best.profile.buys, candidate))) {
-        const candidate = standingAgainst(combatProfileOf(unit, withResearch, [...best.profile.buys, offer]), defender);
+        const candidate = standingAgainst(combatProfileOf(unit, researchDone, [...best.profile.buys, offer]), defender);
         if (isBetterStanding(candidate, improvement || best)) improvement = candidate;
       }
       if (!improvement) return best.profile;
@@ -982,12 +986,27 @@
   }
 
   const upgradedProfileByPair = new Map();
-  const upgradedProfileOf = (unit, enemy) => remembered(upgradedProfileByPair, `${unit.id}>${enemy.id}@${squadSpacing}`,
-    () => bestBuysAgainst(unit, researchedProfileOf(enemy), true));
+  const upgradedProfileOf = (unit, researchDone, enemy, enemyResearchDone) => remembered(upgradedProfileByPair,
+    `${unit.id}[${researchKeyOf(researchDone)}]>${enemy.id}[${researchKeyOf(enemyResearchDone)}]@${squadSpacing}`,
+    () => bestBuysAgainst(unit, unbuiltProfileOf(enemy, enemyResearchDone), researchDone));
+
+  const researchSwitchedOff = { you: new Set(), them: new Set() };
+  const researchNamesByUnit = new Map();
+
+  const researchNamesOf = (unit) => remembered(researchNamesByUnit, unit, () => {
+    const changesStats = combatResearchOf(unit).map((upgrade) => upgrade.name);
+    const unlocksBuys = unit.weapons.filter((weapon) => weapon.source === "Upgrade")
+      .flatMap((weapon) => weapon.requires.filter((requirement) => requirement.kind === "Research").flatMap(researchNamesIn));
+    return [...new Set([...changesStats, ...unlocksBuys])];
+  });
+
+  const researchDoneFor = (unit, side) => new Set(researchNamesOf(unit).filter((name) => !researchSwitchedOff[side].has(name)));
 
   function armsRaceOf(unit, enemy) {
-    const yoursUpgraded = upgradedProfileOf(unit, enemy);
-    const theirsUpgraded = upgradedProfileOf(enemy, unit);
+    const ourResearch = researchDoneFor(unit, "you");
+    const theirResearch = researchDoneFor(enemy, "them");
+    const yoursUpgraded = upgradedProfileOf(unit, ourResearch, enemy, theirResearch);
+    const theirsUpgraded = upgradedProfileOf(enemy, theirResearch, unit, ourResearch);
     return {
       youUpgrade: duelOf(yoursUpgraded, baseProfileOf(enemy)),
       theyUpgrade: duelOf(baseProfileOf(unit), theirsUpgraded),
@@ -998,18 +1017,29 @@
   }
 
   const fightSetupByPair = new Map();
-  const fightSetupOf = (unit, enemy) => remembered(fightSetupByPair, `${unit.id}>${enemy.id}`, () => ({
-    isOpen: false,
-    you: { withResearch: true, buys: upgradedProfileOf(unit, enemy).buys },
-    them: { withResearch: true, buys: upgradedProfileOf(enemy, unit).buys },
-  }));
-  const fightOf = (unit, enemy, setup) => duelOf(combatProfileOf(unit, setup.you.withResearch, setup.you.buys),
-    combatProfileOf(enemy, setup.them.withResearch, setup.them.buys));
+  const fightSetupOf = (unit, enemy) => remembered(fightSetupByPair, `${unit.id}>${enemy.id}`, () => {
+    const { yourBuys, theirBuys } = armsRaceOf(unit, enemy);
+    return { isOpen: false, you: { withResearch: true, buys: yourBuys }, them: { withResearch: true, buys: theirBuys } };
+  });
+  const fightResearchOf = (squad, side, sideSetup) => (sideSetup.withResearch ? researchDoneFor(squad, side) : NO_RESEARCH);
+
+  function settledFightSetupOf(unit, enemy) {
+    const setup = fightSetupOf(unit, enemy);
+    setup.you.buys = buyingRulesOf(unit, fightResearchOf(unit, "you", setup.you)).keepAllowed(setup.you.buys);
+    setup.them.buys = buyingRulesOf(enemy, fightResearchOf(enemy, "them", setup.them)).keepAllowed(setup.them.buys);
+    return setup;
+  }
+
+  const fightOf = (unit, enemy, setup) => duelOf(
+    combatProfileOf(unit, fightResearchOf(unit, "you", setup.you), setup.you.buys),
+    combatProfileOf(enemy, fightResearchOf(enemy, "them", setup.them), setup.them.buys));
+
+  const enemiesOnBoard = (unit, opponent) => opponent.units
+    .filter((enemy) => !enemy.capabilities.builder && isOnBoard(unit, enemy, opponent));
 
   function matchupsAgainst(unit, opponent) {
     const ourCost = fullSquadCost(unit);
-    return opponent.units
-      .filter((enemy) => !enemy.capabilities.builder && isOnBoard(unit, enemy, opponent))
+    return enemiesOnBoard(unit, opponent)
       .map((enemy) => {
         const standing = duelOf(baseProfileOf(unit), baseProfileOf(enemy));
         const enemyCost = fullSquadCost(enemy);
@@ -1137,7 +1167,7 @@
   const renderExchangeCell = (duel) => `<td>${renderExchange(duel.engagement)}</td>`;
 
   function renderFightSide(side, squad, sideSetup, enemyId) {
-    const rules = buyingRulesOf(squad, sideSetup.withResearch);
+    const rules = buyingRulesOf(squad, fightResearchOf(squad, side, sideSetup));
     const fightButton = (action, label, attributes = "") => `<button type="button" id="fight-${escapeHtml(enemyId)}-${side}-${action}"
       data-fight-enemy="${escapeHtml(enemyId)}" data-fight-side="${side}" data-fight-action="${action}" ${attributes}>${label}</button>`;
     const offerSteppers = rules.offers.map((offer, index) => {
@@ -1155,7 +1185,7 @@
       <div class="fight-side-head"><span class="chip-row-label">${side === "you" ? "You" : "Them"}</span>
         <strong>${escapeHtml(squad.name)}</strong>
         <div class="fight-presets">
-          ${fightButton("research", "Research done", `class="scope-btn" aria-pressed="${sideSetup.withResearch}"`)}
+          ${fightButton("research", "Selected research", `class="scope-btn" aria-pressed="${sideSetup.withResearch}"`)}
           ${rules.offers.length ? `${fightButton("best", "Best", `class="scope-btn"`)}${fightButton("none", "None", `class="scope-btn"`)}` : ""}
         </div></div>
       ${squadBuysText ? `<dl class="facts"><div><dt>Squad weapon buys</dt><dd>${squadBuysText}</dd></div></dl>` : ""}
@@ -1164,7 +1194,7 @@
   }
 
   function renderFightPanel(unit, enemy) {
-    const setup = fightSetupOf(unit, enemy);
+    const setup = settledFightSetupOf(unit, enemy);
     const fight = fightOf(unit, enemy, setup);
     return `<tr class="fight-row"><td colspan="7"><div class="fight">
       ${renderFightSide("you", unit, setup.you, enemy.id)}${renderFightSide("them", enemy, setup.them, enemy.id)}
@@ -1194,10 +1224,24 @@
     return renderTable(headerRows, bodyRows, "arms-race-table");
   }
 
+  const researchChoicesFor = (side, unit, opponent) => (side === "you" ? researchNamesOf(unit)
+    : [...new Set(enemiesOnBoard(unit, opponent).flatMap(researchNamesOf))]);
+
+  function renderResearchToggles(side, label, unit, opponent) {
+    const names = researchChoicesFor(side, unit, opponent);
+    if (!names.length) return renderChipRow(label, [renderChip("None")]);
+    const toggles = names.map((name, index) => `<button type="button" class="chip research-toggle" id="research-${side}-${index}"
+      data-research-side="${side}" data-research="${escapeHtml(name)}" aria-pressed="${!researchSwitchedOff[side].has(name)}">${
+      escapeHtml(name)}</button>`);
+    const bulkButton = (bulk, text) => `<button type="button" class="scope-btn" id="research-${side}-${bulk}"
+      data-research-side="${side}" data-research-bulk="${bulk}">${text}</button>`;
+    return renderChipRow(label, [bulkButton("all", "All"), bulkButton("none", "None"), ...toggles]);
+  }
+
   function renderArmsRace(unit, matchups, opponent) {
-    const researchChips = combatResearchOf(unit).map((upgrade) => renderChip(upgrade.name));
-    return renderSection("Upgrade arms race", "Every research done, then the best weapon buys for each fight",
-      `${renderChipRow("Your research", researchChips.length ? researchChips : [renderChip("None")])}
+    return renderSection("Upgrade arms race", "Selected research, then the best weapon buys for each fight",
+      `<div class="research-picker">${renderResearchToggles("you", "Your research", unit, opponent)}${
+        renderResearchToggles("them", "Enemy research", unit, opponent)}</div>
       ${renderArmsRaceTable(unit, matchups, opponent)}`);
   }
 
@@ -1248,7 +1292,7 @@
         Models stand Squad spacing apart, so a blast covering the space of two models hits two, and fewer as the squad
         dies. A shot that misses hits nothing. A model hit by a weapon that throws is knocked down unless its unit is
         immune, and deals no damage until it gets up. The share of a squad lying down at any moment slows the damage it
-        deals by the same share. Weapon buys are picked for the best exchange, so knockdown counts toward them.</li>
+        deals by the same share.</li>
       <li>Exchange is their time to kill you divided by your time to kill them. ${formatRatio(FAVOURED_EXCHANGE)} or more is
         Favoured; ${formatRatio(1 / FAVOURED_EXCHANGE)} or less is Countered.</li>
       <li>Value trade is the exchange adjusted for what each full squad costs, counting requisition and power equally.</li>
@@ -1257,9 +1301,11 @@
         the other fires; a jump covers its jump range at once. Heavy weapons add their setup time before the first shot. The
         Ideal targets and Hard counters cards use this distance-aware exchange. Speed is read as distance per second, which
         has not been checked in game yet, so closing times may be too short.</li>
-      <li>Upgrading means every research that touches the squad is done: health, damage, accuracy, speed, extra leaders, a
-        larger weapon limit and the weapons research hands out. The squad then buys weapons one at a time, each time taking the
-        one that cuts its time to kill that enemy the most, until it reaches its weapon limit or nothing helps. Leaders buy
+      <li>Upgrading means the research switched on under Your research and Enemy research is done: health, damage, accuracy,
+        speed, extra leaders, a larger weapon limit, the weapons research hands out and the weapons it unlocks for buying.
+        Enemy research counts for every enemy unit it touches. Switching research on also switches on what it needs first,
+        and switching it off also switches off what needs it. The squad then buys weapons one at a time, each time taking the
+        one that improves the exchange against that enemy the most, until it reaches its weapon limit or nothing helps. Leaders buy
         their own weapons outside the limit, and a squad the game sets no limit for can upgrade every model once. Damage bonuses
         apply in full, ignoring minimum damage. Research and weapon costs are not counted.</li>
       <li>Fastest tech path is the quickest the unit can appear: every building, add-on and research it needs, built as early
@@ -1300,15 +1346,18 @@
     const setup = fightSetupOf(currentUnit, enemy);
     const [squad, rival] = fightSide === "you" ? [currentUnit, enemy] : [enemy, currentUnit];
     const sideSetup = setup[fightSide];
-    const rivalSetup = setup[fightSide === "you" ? "them" : "you"];
+    const rivalSide = fightSide === "you" ? "them" : "you";
+    const rivalSetup = setup[rivalSide];
     const [action, offerIndex] = fightAction.split("-");
-    const rules = buyingRulesOf(squad, sideSetup.withResearch);
+    const research = fightResearchOf(squad, fightSide, sideSetup);
+    const rules = buyingRulesOf(squad, research);
     const offer = rules.offers[offerIndex];
     if (action === "research") {
       sideSetup.withResearch = !sideSetup.withResearch;
-      sideSetup.buys = buyingRulesOf(squad, sideSetup.withResearch).keepAllowed(sideSetup.buys);
+      sideSetup.buys = buyingRulesOf(squad, fightResearchOf(squad, fightSide, sideSetup)).keepAllowed(sideSetup.buys);
     } else if (action === "best") {
-      sideSetup.buys = bestBuysAgainst(squad, unbuiltProfileOf(rival, rivalSetup.withResearch), sideSetup.withResearch).buys;
+      const rivalUnbuilt = unbuiltProfileOf(rival, fightResearchOf(rival, rivalSide, rivalSetup));
+      sideSetup.buys = bestBuysAgainst(squad, rivalUnbuilt, research).buys;
     } else if (action === "none") {
       sideSetup.buys = [];
     } else if (action === "more" && rules.canBuy(sideSetup.buys, offer)) {
@@ -1316,6 +1365,40 @@
     } else if (action === "fewer" && sideSetup.buys.includes(offer)) {
       const removedIndex = sideSetup.buys.lastIndexOf(offer);
       sideSetup.buys = sideSetup.buys.filter((_, index) => index !== removedIndex);
+    }
+  }
+
+  function researchPrerequisitesIn(race) {
+    const prerequisitesByName = new Map();
+    for (const upgrade of race.units.flatMap((unit) => unit.upgrades)) {
+      const prerequisites = upgrade.requires.filter((requirement) => requirement.kind === "Research")
+        .map((requirement) => researchNamesIn(requirement)[0]);
+      prerequisitesByName.set(upgrade.name, [...new Set([...(prerequisitesByName.get(upgrade.name) || []), ...prerequisites])]);
+    }
+    return prerequisitesByName;
+  }
+
+  function withPrerequisites(name, prerequisitesByName, found = new Set()) {
+    if (found.has(name)) return found;
+    found.add(name);
+    (prerequisitesByName.get(name) || []).forEach((prerequisite) => withPrerequisites(prerequisite, prerequisitesByName, found));
+    return found;
+  }
+
+  function changeResearchSelection({ researchSide, research, researchBulk }) {
+    const switchedOff = researchSwitchedOff[researchSide];
+    if (researchBulk) {
+      const names = researchChoicesFor(researchSide, currentUnit, opponentRace);
+      names.forEach((name) => (researchBulk === "all" ? switchedOff.delete(name) : switchedOff.add(name)));
+      return;
+    }
+    const prerequisitesByName = researchPrerequisitesIn(researchSide === "you" ? currentRace : opponentRace);
+    if (switchedOff.has(research)) {
+      withPrerequisites(research, prerequisitesByName).forEach((needed) => switchedOff.delete(needed));
+    } else {
+      switchedOff.add(research);
+      [...prerequisitesByName.keys()].filter((name) => withPrerequisites(name, prerequisitesByName).has(research))
+        .forEach((dependent) => switchedOff.add(dependent));
     }
   }
 
@@ -1327,13 +1410,14 @@
     const fightButton = event.target.closest("[data-fight-action]");
     const fightRow = event.target.closest("[data-fight]");
     const spacingButton = event.target.closest("[data-spacing-step]");
+    const researchButton = event.target.closest("[data-research-side]");
     if (opponentButton) opponentRace = data.races.find((race) => race.id === opponentButton.dataset.opponent);
     else if (scopeButton) enemyScope = scopeButton.dataset.enemyScope;
+    else if (researchButton) changeResearchSelection(researchButton.dataset);
     else if (spacingButton) {
       const stepped = squadSpacing + Number(spacingButton.dataset.spacingStep) * SQUAD_SPACING.step;
       squadSpacing = Math.min(SQUAD_SPACING.max, Math.max(SQUAD_SPACING.min, stepped));
-    }
-    else if (economyButton) {
+    } else if (economyButton) {
       const { economy: key, step } = economyButton.dataset;
       const current = Math.min(economyAssumptions[key], economyLimitFor(currentRace, key));
       economyAssumptions[key] = Math.min(economyLimitFor(currentRace, key), Math.max(0, current + Number(step)));

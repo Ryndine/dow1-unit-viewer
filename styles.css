@@ -205,6 +205,12 @@ ul.description li + li { margin-top: 2px; }
   font-size: 13px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
 }
 .chip b { font: 700 11.5px/1.4 var(--font-label); letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
+.research-picker { margin-bottom: 18px; }
+.research-toggle { font-family: inherit; color: var(--muted); cursor: pointer; text-decoration: line-through; }
+.research-toggle:hover { color: var(--text); border-color: var(--accent); }
+.research-toggle[aria-pressed="true"] {
+  color: var(--accent); text-decoration: none; border-color: rgb(var(--accent-rgb) / 0.6); background: var(--accent-soft);
+}
 
 .stat-card {
   margin-top: 20px; background: var(--surface); border: 1px solid var(--line);
