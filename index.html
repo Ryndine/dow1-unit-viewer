@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unit Breakdown</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <header class="brand">
+        <h1>Unit Breakdown</h1>
+        <div class="brand-row">
+          <p id="subtitle" class="muted"></p>
+          <button id="theme-toggle" class="theme-toggle" type="button"></button>
+        </div>
+      </header>
+      <div id="races" class="races" role="group" aria-label="Race" hidden></div>
+      <div id="view-switch" class="view-switch" role="group" aria-label="View">
+        <button type="button" class="view-btn" data-view="units" aria-pressed="true">Units</button>
+        <button type="button" class="view-btn" data-view="matchups" aria-pressed="false">Matchups</button>
+      </div>
+      <label class="sr-only" for="search">Search units</label>
+      <input id="search" class="field" type="search" placeholder="Search units  ( / )" autocomplete="off">
+      <nav id="list" aria-label="Units"></nav>
+    </aside>
+    <main id="detail" tabindex="-1"></main>
+  </div>
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
